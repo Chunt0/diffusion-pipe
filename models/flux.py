@@ -173,7 +173,8 @@ class FluxPipeline(BasePipeline):
             if is_main_process():
                 print(f'Overriding transformer using {transformer_path}')
                 #chunt
-            transformer_config = '/opt/diffusion-pipe/configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
+            transformer_config = '/home/chunt/Code/putty-ai/diffusion-pipe//configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
+            #transformer_config = '/opt/diffusion-pipe/configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
             transformer = diffusers.FluxTransformer2DModel.from_single_file(
                 transformer_path,
                 torch_dtype=dtype,
