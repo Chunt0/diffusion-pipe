@@ -27,6 +27,7 @@ DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
 NUM_PROC = min(8, os.cpu_count())
 CAPTIONS_JSON_FILE = 'captions.json'
+ROUND_DECIMAL_DIGITS = 3
 
 UNCOND_FRACTION = 0.0
 
@@ -52,21 +53,30 @@ def shuffle_captions(captions: list[str], count: int = 0, delimiter: str = ', ',
 
 def bucket_suffix(key):
     if len(key) == 2:
-        return f'{key[0]:.3f}_{key[1]}'
+        # AR, frames
+        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}_{key[1]}'
     elif len(key) == 3:
+        # width, height, frames
         return f'{key[0]}x{key[1]}x{key[2]}'
+    elif len(key) == 4:
+        # AR, width, height, frames
+        return f'{key[0]:.{ROUND_DECIMAL_DIGITS}f}x{key[1]}x{key[2]}x{key[3]}'
     else:
         raise RuntimeError(f'Unexpected bucket: {key}')
+
+
+def dedup_and_sort(values):
+    values = set(round(x, ROUND_DECIMAL_DIGITS) for x in values)
+    values = list(values)
+    values.sort()
+    return np.array(values)
 
 
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
     # TODO: remove. Currently using this to avoid recaching everything.
     # cache_arrow_files = list(str(path) for path in cache_dir.glob(f'{cache_file_prefix}*.arrow'))
     # cache_arrow_files.sort()
-    # if not regenerate_cache and len(cache_arrow_files) > 0:
-    #     if map_fn is not None:
-    #         return None
-
+    # if len(cache_arrow_files) > 0:
     #     dataset_shards = thread_map(
     #         datasets.Dataset.from_file,
     #         cache_arrow_files,
@@ -107,6 +117,8 @@ class TextEmbeddingDataset:
     def __init__(self, te_dataset):
         self.te_dataset = te_dataset
         self.image_spec_to_te_idx = defaultdict(list)
+        # TODO: maybe make this use Dataset object like the latents. But, you won't be caching text embeddings
+        # when training on very large datasets, so perhaps it doesn't really matter.
         for i, image_spec in enumerate(te_dataset['image_spec']):
             self.image_spec_to_te_idx[tuple(image_spec)].append(i)
 
@@ -148,6 +160,13 @@ class SizeBucketDataset:
         self.model_name = model_name
         self.path = Path(self.directory_config['path'])
         self.cache_dir = self.path / 'cache' / self.model_name / f'cache_{bucket_suffix(size_bucket)}'
+
+        if len(size_bucket) == 4:
+            # rename old folder name to the new one for convenience
+            old_cache_dir = self.path / 'cache' / self.model_name / f'cache_{bucket_suffix(size_bucket[1:])}'
+            if old_cache_dir.exists() and not self.cache_dir.exists():
+                old_cache_dir.rename(self.cache_dir)
+
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
         self.uncond_text_embeddings = []
@@ -156,7 +175,7 @@ class SizeBucketDataset:
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
@@ -166,32 +185,38 @@ class SizeBucketDataset:
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
         )
-        if map_fn is not None:
-            # We can exit early during the caching phase. Only when everything is loaded from cache at the end
-            # do we need the code below.
-            return
 
-        iteration_order = []
-        for example in self.metadata_dataset.select_columns(['image_spec', 'caption']):
-            image_spec = example['image_spec']
-            captions = example['caption']
-            assert len(captions) % self.shuffle_skip == 0
-            for i in range(len(captions) // self.shuffle_skip):
-                iteration_order.append((image_spec, i))
-        # Shuffle again, since one media file can produce multiple training examples. E.g. video, or maybe
-        # in the future data augmentation. Don't need to shuffle text embeddings since those are looked
-        # up by image file name.
-        shuffle_with_seed(iteration_order, 42)
-        self.iteration_order = iteration_order
-        self.image_spec_to_latents_idx = {
-            tuple(image_spec): i
-            for i, image_spec in enumerate(self.latent_dataset['image_spec'])
-        }
-        self.image_spec_to_metadata_idx = {
-            tuple(image_spec): i
-            for i, image_spec in enumerate(self.metadata_dataset['image_spec'])
-        }
+        iteration_order_cache_dir = self.cache_dir / 'iteration_order'
 
+        if regenerate_cache or not iteration_order_cache_dir.exists() or not trust_cache:
+            print('Building iteration order')
+            image_spec_to_latents_idx = {
+                tuple(image_spec): i
+                for i, image_spec in enumerate(self.latent_dataset['image_spec'])
+            }
+
+            iteration_order_list = []
+            for example in self.metadata_dataset.select_columns(['image_spec', 'caption']):
+                image_spec = example['image_spec']
+                captions = example['caption']
+                latents_idx = image_spec_to_latents_idx[tuple(image_spec)]
+                for i, caption in enumerate(captions):
+                    iteration_order_list.append((image_spec, latents_idx, caption, i))
+
+            # Shuffle again, since one media file can produce multiple training examples. E.g. video, or maybe
+            # in the future data augmentation. Don't need to shuffle text embeddings since those are looked
+            # up by image file name.
+            shuffle_with_seed(iteration_order_list, 42)
+
+            def iteration_order_gen():
+                for image_spec, latents_idx, caption, caption_number in iteration_order_list:
+                    yield {'image_spec': image_spec, 'latents_idx': latents_idx, 'caption': caption, 'caption_number': caption_number}
+
+            iteration_order = datasets.Dataset.from_generator(iteration_order_gen, keep_in_memory=True)
+            iteration_order.save_to_disk(str(iteration_order_cache_dir))
+            del iteration_order
+
+        self.iteration_order = datasets.load_from_disk(str(iteration_order_cache_dir))
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         print(f'caching text embeddings: {self.size_bucket}')
@@ -203,21 +228,15 @@ class SizeBucketDataset:
 
     def __getitem__(self, idx):
         idx = idx % len(self.iteration_order)
-        image_spec, caption_number = self.iteration_order[idx]
-        image_spec = tuple(image_spec)
-        captions = self.metadata_dataset[self.image_spec_to_metadata_idx[image_spec]]['caption']
+        entry = self.iteration_order[idx]
 
-        ret = self.latent_dataset[self.image_spec_to_latents_idx[image_spec]]
-        if DEBUG:
-            print(Path(image_spec[1]).stem)
-        offset = random.randrange(self.shuffle_skip)
-        caption_idx = (caption_number*self.shuffle_skip) + offset
+        ret = self.latent_dataset[entry['latents_idx']]
 
         use_uncond = UNCOND_FRACTION > 0 and random.random() < UNCOND_FRACTION
-        caption = '' if use_uncond else captions[caption_idx]
+        caption = '' if use_uncond else entry['caption']
 
         for ds, uncond_ds in zip(self.text_embedding_datasets, self.uncond_text_embeddings):
-            emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(image_spec, caption_idx)
+            emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), entry['caption_number'])
             ret.update(emb_dict)
         ret['caption'] = caption
         return ret
@@ -244,7 +263,7 @@ class ConcatenatedBatchedDataset:
         for k, dataset_idx in enumerate(iteration_order):
             iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
             cumulative_sums[dataset_idx] += 1
-        self.iteration_order = iteration_order
+        self.iteration_order = np.array(iteration_order)
         self.batch_size = batch_size_image if size_bucket[-1] == 1 else batch_size
         self._make_divisible_by(self.batch_size)
         self.post_init_called = True
@@ -257,7 +276,7 @@ class ConcatenatedBatchedDataset:
         assert self.post_init_called
         start = idx * self.batch_size
         end = start + self.batch_size
-        return [self.datasets[i][j] for i, j in self.iteration_order[start:end]]
+        return [self.datasets[i.item()][j.item()] for i, j in self.iteration_order[start:end]]
 
     def _make_divisible_by(self, n):
         new_length = (len(self.iteration_order) // n) * n
@@ -281,7 +300,7 @@ class ARBucketDataset:
     def get_size_bucket_datasets(self):
         return self.size_buckets
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.ar_frames}')
 
         for res in self.resolutions:
@@ -294,15 +313,17 @@ class ARBucketDataset:
             metadata_with_size_bucket = self.metadata_dataset.map(
                 lambda example: {'size_bucket': size_bucket},
                 cache_file_name=str(self.cache_dir / 'metadata/metadata_with_size_bucket.arrow'),
-                load_from_cache_file=(not regenerate_cache),
+                load_from_cache_file=(not regenerate_cache and trust_cache),
                 desc='Adding size bucket',
             )
+            # to make sure the directory has a unique name
+            naming_size_bucket = (self.ar_frames[0],) + size_bucket
             self.size_buckets.append(
-                SizeBucketDataset(metadata_with_size_bucket, self.directory_config, size_bucket, self.model_name)
+                SizeBucketDataset(metadata_with_size_bucket, self.directory_config, naming_size_bucket, self.model_name)
             )
 
         for ds in self.size_buckets:
-            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         print(f'caching text embeddings: {self.ar_frames}')
@@ -333,6 +354,7 @@ class DirectoryDataset:
             self.resolutions = self._process_user_provided_resolutions(
                 directory_config.get('resolutions', dataset_config['resolutions'])
             )
+            self.resolutions = dedup_and_sort(self.resolutions)
             self.ar_bucket_datasets = []
         self.shuffle = directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0))
         self.directory_config['cache_shuffle_num'] = self.shuffle # Make accessible if it wasn't yet, for picking one out
@@ -365,6 +387,7 @@ class DirectoryDataset:
             max_ar = self.directory_config.get('max_ar', self.dataset_config['max_ar'])
             num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
             self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
+        self.ars = dedup_and_sort(self.ars)
         self.log_ars = np.log(self.ars)
         frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
         if 1 not in frame_buckets:
@@ -542,7 +565,7 @@ class DirectoryDataset:
                 metadata_dataset = metadata_dataset.map(
                     add_captions,
                     cache_file_name=str(self.cache_dir / 'metadata/metadata_with_captions.arrow'),
-                    load_from_cache_file=(not regenerate_cache),
+                    load_from_cache_file=(not regenerate_cache and trust_cache),
                     desc='Adding captions',
                 )
                 del caption_data
@@ -709,25 +732,21 @@ class DirectoryDataset:
         return size_bucket
 
     def _process_user_provided_ars(self, ars):
-        ar_buckets = set()
+        ar_buckets = []
         for ar in ars:
             if isinstance(ar, (tuple, list)):
                 assert len(ar) == 2
-                ar = round(ar[0] / ar[1], 6)
-            ar_buckets.add(ar)
-        ar_buckets = list(ar_buckets)
-        ar_buckets.sort()
-        return np.array(ar_buckets)
+                ar = ar[0] / ar[1]
+            ar_buckets.append(ar)
+        return ar_buckets
 
     def _process_user_provided_resolutions(self, resolutions):
-        result = set()
+        result = []
         for res in resolutions:
             if isinstance(res, (tuple, list)):
                 assert len(res) == 2
-                res = round(math.sqrt(res[0] * res[1]), 6)
-            result.add(res)
-        result = list(result)
-        result.sort()
+                res = math.sqrt(res[0] * res[1])
+            result.append(res)
         return result
 
     def get_size_bucket_datasets(self):
@@ -738,11 +757,11 @@ class DirectoryDataset:
             result.extend(ar_bucket_dataset.get_size_bucket_datasets())
         return result
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.path}')
         datasets = self.size_bucket_datasets if self.use_size_buckets else self.ar_bucket_datasets
         for ds in datasets:
-            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         print(f'caching text embeddings: {self.path}')
@@ -755,7 +774,7 @@ class DirectoryDataset:
             empty_caption_ds,
             map_fn,
             cache_dir=self.cache_dir,
-            cache_file_prefix='uncond_text_embeddings_',
+            cache_file_prefix=f'uncond_text_embeddings_{i}_',
             regenerate_cache=regenerate_cache,
         )
         for size_bucket_ds in self.get_size_bucket_datasets():
@@ -880,9 +899,9 @@ class Dataset:
         for ds in self.directory_datasets:
             ds.cache_metadata(regenerate_cache=regenerate_cache, trust_cache=trust_cache)
 
-    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+    def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         for ds in self.directory_datasets:
-            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         for ds in self.directory_datasets:
@@ -951,7 +970,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         return results
 
     for ds in datasets:
-        ds.cache_latents(latents_map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+        ds.cache_latents(latents_map_fn, regenerate_cache=regenerate_cache, trust_cache=trust_cache, caching_batch_size=caching_batch_size)
 
     for text_encoder_idx in range(num_text_encoders):
         def text_embedding_map_fn(example, rank):
@@ -1041,7 +1060,7 @@ class DatasetManager:
         # Now load all datasets from cache.
         for ds in self.datasets:
             ds.cache_metadata(trust_cache=True)
-            ds.cache_latents(None)
+            ds.cache_latents(None, trust_cache=True)
             for i in range(1, len(self.text_encoders)+1):
                 ds.cache_text_embeddings(None, i)
 
@@ -1103,7 +1122,7 @@ def split_batch(batch, pieces):
 # pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
 # Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
 class PipelineDataLoader:
-    def __init__(self, dataset, model_engine, gradient_accumulation_steps, model, num_dataloader_workers=2):
+    def __init__(self, dataset, model_engine, gradient_accumulation_steps, model, num_dataloader_workers=1):
         if len(dataset) == 0:
             raise RuntimeError(
                 'Processed dataset was empty. Probably caused by rounding down for each size bucket.\n'
@@ -1169,6 +1188,7 @@ class PipelineDataLoader:
             sampler=sampler,
             num_workers=self.num_dataloader_workers,
             persistent_workers=(self.num_dataloader_workers > 0),
+            prefetch_factor=2 if self.num_dataloader_workers > 0 else None,
         )
 
     def _pull_batches_from_dataloader(self):

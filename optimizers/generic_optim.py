@@ -243,11 +243,16 @@ class GenericOptim(Optimizer):
             muon=False,
             adamuon=False,
             compile=False,
+            automagic=False,
+            min_lr=1e-7,
+            max_lr=1e-3,
+            lr_bump=1e-6, # amount to bump the lr when adjusting
+            lr_decrease_factor=1.0, # how much more to decrease the LR vs increase
     ):
         self.momentum_type = momentum_type
         assert self.momentum_type in ["ema", "sm", "none"]
         self.second_moment_type = second_moment_type
-        assert self.second_moment_type in ["ema", "none", "sn"]
+        assert self.second_moment_type in ["ema", "none", "sn", "factored"]
 
         require_version("torch>=1.5.0")  # add_ with alpha
         if lr < 0.0:
@@ -262,13 +267,15 @@ class GenericOptim(Optimizer):
             raise ValueError('Only one of muon, adamuon can be True')
 
         defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias, 'correct_dim': correct_dim,
-                    'cpu_offload': cpu_offload, 'muon': muon, 'adamuon': adamuon, 'compile': compile}
+                    'cpu_offload': cpu_offload, 'muon': muon, 'adamuon': adamuon, 'compile': compile, 'automagic': automagic, 'min_lr': min_lr,
+                    'max_lr': max_lr, 'lr_bump': lr_bump, 'lr_decrease_factor': lr_decrease_factor}
         super().__init__(params, defaults)
         self.check_params()
         # Print out all configurations
         print(f"GenericOptim Configuration: lr={lr}, betas={betas}, eps={eps}, weight_decay={weight_decay}, "
               f"correct_bias={correct_bias}, momentum_type={momentum_type}, second_moment_type={second_moment_type}, correct_dim={correct_dim}, "
-              f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, compile={compile}")
+              f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
+              f"max_lr={max_lr}, lr_bump={lr_bump}, lr_decrease_factor={lr_decrease_factor}")
 
     @torch.no_grad()
     def step(self, closure: Callable = None):
@@ -301,9 +308,16 @@ class GenericOptim(Optimizer):
                 if "step" not in state:
                     state["step"] = 0
                 state["step"] += 1
-                step_size = group["lr"]
                 cpu_offload = group['cpu_offload'] if p.ndim >= 2 else False
                 state_device = 'cpu' if cpu_offload else p.device
+
+                # learning rate
+                if group.get('automagic', False):
+                    automagic_lr = self.update_automagic_lr(group, state, p.grad, state_device)
+                    step_size = 1.0
+                else:
+                    automagic_lr = None
+                    step_size = group['lr']
 
                 # get momentum
                 numerator = self.get_numerator(group, state, p, state_device)
@@ -323,6 +337,7 @@ class GenericOptim(Optimizer):
                     else:
                         orthogonalize = zeropower_via_newtonschulz5
                     numerator = orthogonalize(numerator, steps=NS_STEPS)
+                    step_size *= 0.2
 
                 if muon:
                     step_size *= math.sqrt(max(rows, cols))
@@ -345,12 +360,15 @@ class GenericOptim(Optimizer):
                         bias_correction2 = 1.0 - beta2 ** state["step"]
                         step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
 
+                if automagic_lr is not None:
+                    numerator.mul_(automagic_lr)
+
                 update = torch.zeros_like(p)
 
                 # step
                 if denominator is None:  # no adaptive step size
                     update.add_(numerator, alpha=-step_size)
-                elif self.second_moment_type == "ema":  # standard adam
+                elif self.second_moment_type in ('ema', 'factored'):  # standard adam
                     update.addcdiv_(numerator, denominator, value=-step_size)
                 elif self.second_moment_type == "sn":  # subset norm requires broadcast division
                     if "subset_size" in group and group["subset_size"] != "heuristics":
@@ -388,7 +406,7 @@ class GenericOptim(Optimizer):
             torch.cuda.synchronize()
 
         if len(skipped_parameter_names) > 0:
-            print(f'WARNING: the following parameters had their updates skipped due to Inf or NaN: {skipped_parameter_names}')
+            print(f'WARNING: {len(skipped_parameter_names)} parameter updates were skipped due to Inf or NaN.')
 
         return loss
 
@@ -413,9 +431,12 @@ class GenericOptim(Optimizer):
 
     def get_denominator(self, group, state, grad, state_device):
         beta1, beta2 = group["betas"]
-        if beta2 == 0 or self.second_moment_type == "none":
+        second_moment_type = self.second_moment_type
+        if second_moment_type == 'factored' and grad.ndim == 1:
+            second_moment_type = 'ema'
+        if beta2 == 0 or second_moment_type == "none":
             return None  # this means only use base lr
-        elif self.second_moment_type == "ema":  # Adam style
+        elif second_moment_type == "ema":  # Adam style
             if "exp_avg_sq" not in state:  # initialization
                 state["exp_avg_sq"] = torch.zeros_like(grad)
             exp_avg_sq = state["exp_avg_sq"].to(grad.device, non_blocking=True)
@@ -425,10 +446,61 @@ class GenericOptim(Optimizer):
                 exp_avg_sq.add_(grad**2)
             state['exp_avg_sq'] = exp_avg_sq.to(state_device)
             return exp_avg_sq.sqrt().add_(group["eps"])
-        elif self.second_moment_type == "sn":
+        elif second_moment_type == "sn":
             return get_and_update_subset_norm_denom(group, state, grad, beta2)
+        elif second_moment_type == 'factored':
+            if 'exp_avg_sq_row' not in state:
+                state['exp_avg_sq_row'] = torch.zeros(grad.shape[:-1], dtype=grad.dtype, device=grad.device)
+                state['exp_avg_sq_col'] = torch.zeros(grad.shape[:-2] + grad.shape[-1:], dtype=grad.dtype, device=grad.device)
+            exp_avg_sq_row = state['exp_avg_sq_row']
+            exp_avg_sq_col = state['exp_avg_sq_col']
+            grad_sq = grad**2
+            exp_avg_sq_row.mul_(beta2).add_(grad_sq.mean(dim=-1), alpha=(1.0 - beta2))
+            exp_avg_sq_col.mul_(beta2).add_(grad_sq.mean(dim=-2), alpha=(1.0 - beta2))
+            r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).unsqueeze(-1)
+            c_factor = exp_avg_sq_col.unsqueeze(-2)
+            return torch.mul(r_factor, c_factor).sqrt_().add_(group['eps'])
         else:
-            raise ValueError(f"Unrecognized second moment (adaptive step size) type {self.second_moment_type}.")
+            raise ValueError(f"Unrecognized second moment (adaptive step size) type {second_moment_type}.")
+
+    def update_automagic_lr(self, group, state, update, state_device):
+        if 'automagic_lr' not in state:
+            state['automagic_lr'] = torch.full_like(update, group['lr_bump'])
+            state['avg_lr'] = torch.mean(state['automagic_lr'])
+        automagic_lr = state['automagic_lr'].to(update.device, non_blocking=True)
+        if 'exp_avg' in state:
+            # Use momentum for last_polarity.
+            exp_avg = state['exp_avg'].to(update.device, non_blocking=True)  # may be offloaded
+            state['exp_avg'] = exp_avg  # slight optimization for future code if we moved it to GPU
+            last_polarity = exp_avg > 0
+        else:
+            # We use the sign bit as the last polarity because lr must be positive.
+            last_polarity = automagic_lr > 0
+        automagic_lr = automagic_lr.abs()
+        current_polarity = update > 0
+        lr_bump = group['lr_bump']
+        new_lr = torch.where(
+            last_polarity == current_polarity,
+            automagic_lr + lr_bump,  # Increase lr
+            automagic_lr - group['lr_decrease_factor']*lr_bump  # Decrease lr
+        )
+        new_lr = torch.clamp(
+            new_lr,
+            min=group['min_lr'],
+            max=group['max_lr'],
+        )
+        state['avg_lr'] = torch.mean(new_lr)
+        # Store polarity in sign bit.
+        state['automagic_lr'] = torch.where(current_polarity, new_lr, -new_lr).to(state_device)
+        return new_lr
+
+    @staticmethod
+    def _get_lr(param_group, param_state):
+        if 'avg_lr' in param_state:
+            lr = param_state["avg_lr"]
+        else:
+            lr = torch.tensor(0.0)
+        return lr
 
     @torch.no_grad()
     def check_params(self):

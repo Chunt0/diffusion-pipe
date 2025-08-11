@@ -8,13 +8,15 @@
 |HunyuanVideo    |✅    |❌              |✅                |
 |Cosmos          |✅    |❌              |❌                |
 |Lumina Image 2.0|✅    |✅              |❌                |
-|Wan2.1          |✅    |❌              |✅                |
+|Wan2.1          |✅    |✅              |✅                |
 |Chroma          |✅    |✅              |✅                |
 |HiDream         |✅    |❌              |✅                |
 |SD3             |✅    |❌              |✅                |
 |Cosmos-Predict2 |✅    |✅              |✅                |
 |OmniGen2        |✅    |❌              |❌                |
 |Flux Kontext    |✅    |✅              |✅                |
+|Wan2.2          |✅    |✅              |✅                |
+|Qwen-Image      |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -294,3 +296,85 @@ See the [Flux Kontext example dataset config](../examples/flux_kontext_dataset.t
 **IMPORTANT**: The control/context images should be approximately the same aspect ratio as the target images. All of the aspect ratio and size bucketing is done with respect to the target images. Then, the control image is resized and cropped to match the target image size. If the aspect ratio of the control image is very different from the target image, it will be cropping away a lot of the control image.
 
 Flux Kontext LoRAs are saved in Diffusers format, which will work in ComfyUI.
+
+## Wan2.2
+Load from checkpoint:
+```
+[model]
+type = 'wan'
+ckpt_path = '/data/imagegen_models/Wan2.2-T2V-A14B'
+transformer_path = '/data/imagegen_models/Wan2.2-T2V-A14B/low_noise_model'
+dtype = 'bfloat16'
+transformer_dtype = 'float8'
+min_t = 0
+max_t = 0.875
+```
+Or, load from ComfyUI files to save space:
+```
+[model]
+type = 'wan'
+ckpt_path = '/data/imagegen_models/Wan2.2-T2V-A14B'
+transformer_path = '/data/imagegen_models/comfyui-models/wan2.2_t2v_low_noise_14B_fp16.safetensors'
+llm_path = '/data2/imagegen_models/comfyui-models/umt5_xxl_fp16.safetensors'
+dtype = 'bfloat16'
+transformer_dtype = 'float8'
+```
+
+The 5B model is also supported, but only for t2v / t2i training, not i2v.
+
+The LoRAs are saved in ComfyUI format.
+
+### Notes on loading models
+When loading from ComfyUI files, you still need the checkpoint folder with the VAE and config files inside it, but it doesn't need the transformer or T5. You can download it and skip those files like this:
+```
+huggingface-cli download Wan-AI/Wan2.2-T2V-A14B --local-dir Wan2.2-T2V-A14B --exclude "models_t5*" "*/diffusion_pytorch_model*"
+```
+For Wan2.2 A14B, if you are loading fully from the checkpoint folder, you need to use ```transformer_path``` to point to the subfolder of the model you want to train, i.e. low noise or high noise.
+
+### Timestep ranges
+Wan2.2 A14B has two models: low noise and high noise. They process different parts of the timestep range during inference, switching between models once the timestep reaches a certain boundary. t=0 is no noise, t=1 is fully noise. The models are independent; you can train LoRAs for either one, or both.
+
+I couldn't find any exact details on what timesteps the Wan team used to train each model, but presumably they trained it to match how it would be used at inference time. For the T2V model, the configured inference boundary timestep is 0.875. For I2V, it is 0.9. You can (and should) use the ```min_t``` and ```max_t``` parameters to restrict the training timestep range appropriate for the model. For example, the first model config above has the timestep range set for the low noise T2V model. I don't know if the training timestep range should exactly match the inference boundary or not. For the high noise T2V model, you would use:
+```
+min_t = 0.875
+max_t = 1
+```
+Controlling the timestep range like this will work correctly even if you are using the ```shift``` or ```flux_shift``` parameters to shift the timestep distribution.
+
+Alternatively, people have noticed that the low noise model can be used entirely on its own. So you could just train the low noise model without restricting the timestep range, just like you would do with Wan2.1.
+
+## Qwen-Image
+```
+[model]
+type = 'qwen_image'
+diffusers_path = '/data/imagegen_models/Qwen-Image'
+dtype = 'bfloat16'
+transformer_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+```
+Or load from individual files:
+```
+[model]
+type = 'qwen_image'
+transformer_path = '/data/imagegen_models/comfyui-models/qwen_image_bf16.safetensors'
+text_encoder_path = '/data/imagegen_models/comfyui-models/qwen_2.5_vl_7b.safetensors'
+vae_path = '/data/imagegen_models/Qwen-Image/vae/diffusion_pytorch_model.safetensors'
+dtype = 'bfloat16'
+transformer_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+```
+In the second format, ```transformer_path``` and ```text_encoder_path``` should be the ComfyUI files, but ```vae_path``` needs to be the **Diffusers VAE** (the weight key names are completely different and the ComfyUI VAE isn't currently supported). You should use bf16 files even if you are casting the transformer to float8; fp8_scaled weights won't work at all, and fp8 weights might have slightly lower quality because the training script tries to keep some weights in higher precision. If you give both ```diffusers_path``` and the individual model paths, it will prefer to read the sub-model from the individual path.
+
+As of this writing you will need the latest Diffusers:
+```
+pip uninstall diffusers
+pip install git+https://github.com/huggingface/diffusers
+```
+
+Qwen-Image LoRAs are saved in ComfyUI format.
+
+### Training LoRAs on a single 24GB GPU
+- You will need block swapping. See the [example 24GB VRAM config](../examples/qwen_image_24gb_vram.toml) which has everything set correctly.
+- Use the expandable segments CUDA feature: ```PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True NCCL_P2P_DISABLE="1" NCCL_IB_DISABLE="1" deepspeed --num_gpus=1 train.py --deepspeed --config /home/anon/code/diffusion-pipe-configs/tmp.toml```
+- Use a dataset resolution of 640. This is one of the resolutions the model was trained with and might work a bit better than 512.
+- If you use higher LoRA rank or higher resolution, you might need to increase blocks_to_swap.

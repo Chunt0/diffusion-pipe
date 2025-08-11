@@ -44,6 +44,7 @@ parser.add_argument('--local_rank', type=int, default=-1,
                     help='local rank passed from distributed launcher')
 parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None,
                     help='resume training from checkpoint. If no value is provided, resume from the most recent checkpoint. If a folder name is provided, resume from that specific folder.')
+parser.add_argument('--reset_dataloader', action='store_true', help='Start dataloader from scratch when resuming from checkpoint, i.e. only load the optimizer states.')
 parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
 parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
 parser.add_argument('--trust_cache', action='store_true', help='Load from metadata cache files if they exist, without checking if any fingerprints have changed. Can make loading much faster for large datasets.')
@@ -312,7 +313,7 @@ if __name__ == '__main__':
         from models import lumina_2
         model = lumina_2.Lumina2Pipeline(config)
     elif model_type == 'wan':
-        from models import wan
+        from models.wan import wan
         model = wan.WanPipeline(config)
     elif model_type == 'chroma':
         from models import chroma
@@ -329,6 +330,9 @@ if __name__ == '__main__':
     elif model_type == 'omnigen2':
         from models import omnigen2
         model = omnigen2.OmniGen2Pipeline(config)
+    elif model_type == 'qwen_image':
+        from models import qwen_image
+        model = qwen_image.QwenImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -716,7 +720,10 @@ if __name__ == '__main__':
         )
         dist.barrier()  # just so the print below doesn't get swamped
         assert load_path is not None
-        train_dataloader.load_state_dict(client_state['custom_loader'])
+        if args.reset_dataloader:
+            train_dataloader.epoch = client_state['custom_loader']['epoch']
+        else:
+            train_dataloader.load_state_dict(client_state['custom_loader'])
         step = client_state['step'] + 1
         del client_state
         if is_main_process():
@@ -731,8 +738,6 @@ if __name__ == '__main__':
     model_engine.total_steps = steps_per_epoch * config['epochs']
 
     eval_dataloaders = {
-        # Set num_dataloader_workers=0 so dataset iteration is completely deterministic.
-        # We want the exact same noise for each image, each time, for a stable validation loss.
         name: dataset_util.PipelineDataLoader(eval_data, model_engine, config['eval_gradient_accumulation_steps'], model, num_dataloader_workers=0)
         for name, eval_data in eval_data_map.items()
     }
@@ -767,10 +772,11 @@ if __name__ == '__main__':
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, step)
-            if optimizer.__class__.__name__ == 'Automagic':
+            if optimizer.__class__.__name__ in ('Automagic', 'GenericOptim'):
                 lrs, avg_lr = _get_automagic_lrs(optimizer)
-                tb_writer.add_histogram(f'train/automagic_lrs', lrs, step)
-                tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, step)
+                if avg_lr > 0:
+                    tb_writer.add_histogram(f'train/automagic_lrs', lrs, step)
+                    tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, step)
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model, model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
